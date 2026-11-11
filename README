@@ -1,0 +1,149 @@
+Carausu Nelu-Rares-Ionut 341C4
+
+Tema 2 PCom
+
+
+Cerinte rezolvate:
+
+Carti in format text (30p) - Protocolul transmite corect cartile in format text.
+Imagini (35p) - Protocolul transmite corect imagini.
+Conexiuni multiple (35p) - Stabilirea conexiunii folosind three way handshake
+                           si functionarea cu mai multe conexiuni in acelasi timp.
+
+Total checker local: 100/100
+
+
+Three-way handshake:
+
+- am definit in `protocol.h` valorile pentru campul `type`:
+  TYPE_DATA = 0, TYPE_ACK = 1, TYPE_SYN = 2, TYPE_SYNACK = 3, TYPE_ACKCONN = 4
+
+- server-ul atribuie conn_id-ul (incremental); clientul il primeste in
+  campul `conn_id` al SYN-ACK-ului si il foloseste in toate segmentele ulterioare
+
+- portul nou e generat de kernel prin `bind(port=0)` si citit cu
+  `getsockname`; este transmis in payload-ul SYN-ACK ca `uint16_t`
+
+- socket-ul listen ramane separat de `data_fds[]`. `wait4connect` blocheaza
+  direct pe el cu `recvfrom`; asta permite multi-client: `receiver_handler`
+  proceseaza in paralel pe socket-urile conexiunilor active
+
+- se face retransmisie in handshake prin `SO_RCVTIMEO = 1s` si bucla de retry
+  (maxim 20 pe client si 10 pe server); daca in loc de ACKCONN soseste primul
+  DATA, e tratat ca si confirmare implicita a handshake-ului
+
+- dupa handshake, socket-ul intra in `data_fds[]`, se creeaza `timerfd`
+  pentru retransmisii, iar `SO_RCVTIMEO` se dezactiveaza
+
+
+Conexiuni multiple simultane:
+
+- pentru a accepta mai multi clienti simultan, server-ul foloseste o separare
+  intre socket-uri:
+* socket-ul listen (port 8032) sta deoparte si e folosit doar pentru `SYN`-uri noi;
+  nu intra in data_fds[]
+* fiecare conexiune primeste socket-ul ei pe un port random, alocat in `wait4connect`
+
+- `wait4connect` poate fi apelat de mai multe ori in succesiune; fiecare apel:
+* asteapta blocant pe socket-ul listen pana soseste un `SYN` nou
+* executa handshake-ul (`SYN-ACK` + `ACKCONN`)
+* adauga noua conexiune in `cons[]` si `data_fds[]`
+
+- in paralel, `receiver_handler` monitorizeaza cu poll toate socket-urile
+  din `data_fds[]` si proceseaza datele venite pe oricare dintre ele; astfel,
+  in timp ce thread-ul principal e ocupat cu un handshake nou, datele clientilor
+  deja conectati continua sa fie procesate de handler
+- sincronizarea intre thread-ul main (`wait4connect`) si thread-ul handler este
+  prin `g_cons_mtx` global, care protejeaza modificarile la `cons[]`, `data_fds[]`,
+  `timer_fds[]`, `fdmax`
+- per-conexiune, sincronizarea intre thread-ul principal si thread-ul handler
+  este prin `con_lock` (mutex per conexiune)
+
+
+Fereastra glisanta pentru sender:
+
+fereastra efectiva = min(max_window_seq, peer_recv_window / MAX_DATA_SIZE )
+
+bdp_bytes = speed * delay * 250
+target_segs  = 3 * bdp_bytes / MAX_DATA_SIZE
+g_max_window = max(MIN_WINDOW_SEGS=16, target_segs)
+
+- pe link-ul de test (8 Mb/s, 1ms): BDP = 4000B -> target = 11 -> floor la 16;
+  limita suplimentara de `peer_recv_window = 9216/1024 = 9 segmente`; efectiv
+  sunt 9 segmente in-flight, aprox. 2,25x BDP
+
+Operatii:
+
+- `send_data` copiaza bytes in `send_buf` (pana la `SEND_BUF_CAP`), apoi
+  apeleaza `try_send_more` ca sa trimita imediat daca fereastra are loc;
+  returneaza `-1` daca buffer-ul e plin
+
+- `try_send_more` umple fereastra cat permite fereastra efectiva; plus se
+  face verificare de 1 segment cand fereastra e goala si `peer_window = 0`
+  (evita deadlock pe zero-window)
+
+- `send_one_new_segment` ia pana la `MAX_DATA_SIZE` bytes din `send_buf`, apoi
+  asigneaza `seq_num = next_seq_num++` si salveaza `first_sent_ms = now_ms()`;
+  se apeleaza `tx_data_segment` (sendto pe socket) si se face push la coada `window`
+
+- la primire ACK (cumulative), toate segmentele cu `seq_num < ack_num`
+  se scot cu `window.pop_front()`; fereastra este mutata la dreapta
+
+
+Fereastra glisanta pentru receiver:
+
+W = recv_buf_max / MAX_DATA_SIZE = 9 segmente
+fereastra efectiva de acceptare = [expected_seq, expected_seq + W)
+
+
+Operatii:
+
+- `recv_data` se blocheaza pe `pthread_cond_wait(&data_available, &con_lock)`
+  pana cand `receiver_handler` semnaleaza ca `recv_buf` are date; apoi, copiaza
+  `min(len, recv_buf.size())` bytes si revine
+
+
+Procesarea unui segment de tip DATA:
+
+- receiver-ul ia decizia ce face cu un segment de tip DATA in functie de unde
+  se afla seq_num fata de fereastra de acceptare, avand 4 cazuri posibile:
+* in afara ferestrei (prea inainte, peste marginea dreapta): nu este pastrat -
+  nu este loc pentru a-l pune fara a se risca overflow la buffer; se trimite totusi
+  ACK la sender ca sa-si actualizeze starea
+* exact ce se astepta (`seq_num == expected_seq`, in ordine): este scris direct
+  in recv_buf si se avanseaza expected_seq; apoi se verifica daca in `oos` sunt segmente
+  alaturate care acum se pot lipi; este semnalata conditia `data_available` ca sa fie
+  trezit `recv_data` care eventual astepta;
+  se trimite ACK cumulativ cu noul `expected_seq`
+* in fereastra, dar inaintea celui asteptat (exista un gol): este salvat in `oos`
+  ca sa fie avut cand se va umple golul; se trimite ACK cu `expected_seq` neschimbat -
+  un ACK duplicat care va declansa `fast retransmit` la sender pentru segmentul lipsa
+* mai vechi decat cel asteptat (duplicat, a fost primit deja): este aruncat; se trimite
+  totusi ACK ca sender-ul sa stie stadiul actual (poate ACK-ul vechi s-a pierdut)
+
+
+ACK Cumulativ:
+
+- fiecare ACK trimis are: `ack_num` = `expected_seq` curent si
+  recv_window = `recv_buf_max - recv_buf.size()` (flow control feedback)
+- ACK-urile duplicate (cu acelasi `ack_num`) sunt importante
+  pentru a se face `fast retransmit` de la sender
+
+
+Fast Retransmit
+
+- receiver-ul trimite ACK cumulativ pentru fiecare segment primit,
+  cu `ack_num` = `expected_seq` (cel mai mic seq inca neprimit)
+- daca un segment se pierde, dar urmatoarele sosesc, receiver-ul trimite ACK-uri
+  cu acelasi `ack_num` (segmentul lipsa ramane expected)
+- sender-ul numara ACK-urile duplicate; la 3 ACK-uri duplicate, deduce ca segmentul
+  de la `ack_num` e pierdut si il retransmite imediat
+
+
+Retransmit Timeout cu age-check
+
+- `timerfd` ticaie periodic la `g_timer_tick_ms`; la fiecare tick, daca
+  `window.front()` e mai vechi de `g_rto_ms`, se face retransmisie
+- fast retransmit e mai rapid, dar necesita feedback (ACK-uri duplicate);
+  daca sunt pierdute prea multe segmente la rand si receiver-ul nu mai are
+  ce sa ACK-uiasca, va fi folosit RTO
